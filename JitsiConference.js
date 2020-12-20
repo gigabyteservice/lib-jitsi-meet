@@ -1483,6 +1483,19 @@ JitsiConference.prototype.muteParticipant = function(id) {
     this.room.muteParticipant(participant.getJid(), true);
 };
 
+/**
+ * Mutes a participant.
+ * @param {string} id The id of the participant to unmute.
+ */
+JitsiConference.prototype.unMuteParticipant = function(id) {
+    const participant = this.getParticipantById(id);
+
+    if (!participant) {
+        return;
+    }
+    this.room.muteParticipant(participant.getJid(), false);
+};
+
 /* eslint-disable max-params */
 
 /**
