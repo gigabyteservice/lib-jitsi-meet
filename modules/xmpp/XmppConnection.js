@@ -3,9 +3,10 @@ import { $pres, Strophe } from 'strophe.js';
 import 'strophejs-plugin-stream-management';
 
 import Listenable from '../util/Listenable';
-import { getJitterDelay } from '../util/Retry';
 
+import ResumeTask from './ResumeTask';
 import LastSuccessTracker from './StropheLastSuccess';
+import PingConnectionPlugin from './strophe.ping';
 
 const logger = getLogger(__filename);
 
@@ -44,20 +45,16 @@ export default class XmppConnection extends Listenable {
      * default with jitter. Pass -1 to disable. The actual interval equation is:
      * jitterDelay = (interval * 0.2) + (0.8 * interval * Math.random())
      * The keep alive is HTTP GET request to the {@link options.serviceUrl}.
+     * @param {Object} [options.xmppPing] - The xmpp ping settings.
      */
-    constructor({ enableWebsocketResume, websocketKeepAlive, serviceUrl }) {
+    constructor({ enableWebsocketResume, websocketKeepAlive, serviceUrl, xmppPing }) {
         super();
         this._options = {
             enableWebsocketResume: typeof enableWebsocketResume === 'undefined' ? true : enableWebsocketResume,
+            pingOptions: xmppPing,
             websocketKeepAlive: typeof websocketKeepAlive === 'undefined' ? 4 * 60 * 1000 : Number(websocketKeepAlive)
         };
 
-        /**
-         * The counter increased before each resume retry attempt, used to calculate exponential backoff.
-         * @type {number}
-         * @private
-         */
-        this._resumeRetryN = 0;
         this._stropheConn = new Strophe.Connection(serviceUrl);
         this._usesWebsocket = serviceUrl.startsWith('ws:') || serviceUrl.startsWith('wss:');
 
@@ -66,6 +63,8 @@ export default class XmppConnection extends Listenable {
 
         this._lastSuccessTracker = new LastSuccessTracker();
         this._lastSuccessTracker.startTracking(this, this._stropheConn);
+
+        this._resumeTask = new ResumeTask(this._stropheConn);
 
         /**
          * @typedef DeferredSendIQ Object
@@ -80,6 +79,16 @@ export default class XmppConnection extends Listenable {
          * @private
          */
         this._deferredIQs = [];
+
+        // Ping plugin is mandatory for the Websocket mode to work correctly. It's used to detect when the connection
+        // is broken (WebSocket/TCP connection not closed gracefully).
+        this.addConnectionPlugin(
+            'ping',
+            new PingConnectionPlugin({
+                getTimeSinceLastServerResponse: () => this.getTimeSinceLastSuccess(),
+                onPingThresholdExceeded: () => this._onPingErrorThresholdExceeded(),
+                pingOptions: xmppPing
+            }));
     }
 
     /**
@@ -88,7 +97,10 @@ export default class XmppConnection extends Listenable {
      * @returns {boolean}
      */
     get connected() {
-        return this._status === Strophe.Status.CONNECTED || this._status === Strophe.Status.ATTACHED;
+        const websocket = this._stropheConn && this._stropheConn._proto && this._stropheConn._proto.socket;
+
+        return (this._status === Strophe.Status.CONNECTED || this._status === Strophe.Status.ATTACHED)
+            && (!this.isUsingWebSocket || (websocket && websocket.readyState === WebSocket.OPEN));
     }
 
     /**
@@ -161,6 +173,13 @@ export default class XmppConnection extends Listenable {
      */
     get options() {
         return this._stropheConn.options;
+    }
+
+    /**
+     * A getter for the domain to be used for ping.
+     */
+    get pingDomain() {
+        return this._options.pingOptions?.domain || this.domain;
     }
 
     /**
@@ -243,7 +262,11 @@ export default class XmppConnection extends Listenable {
             this._maybeEnableStreamResume();
             this._maybeStartWSKeepAlive();
             this._processDeferredIQs();
+            this._resumeTask.cancel();
+            this.ping.startInterval(this._options.pingOptions?.domain || this.domain);
         } else if (status === Strophe.Status.DISCONNECTED) {
+            this.ping.stopInterval();
+
             // FIXME add RECONNECTING state instead of blocking the DISCONNECTED update
             blockCallback = this._tryResumingConnection();
             if (!blockCallback) {
@@ -275,7 +298,10 @@ export default class XmppConnection extends Listenable {
      * @returns {void}
      */
     closeWebsocket() {
-        this._stropheConn._proto && this._stropheConn._proto.socket && this._stropheConn._proto.socket.close();
+        if (this._stropheConn && this._stropheConn._proto) {
+            this._stropheConn._proto._closeSocket();
+            this._stropheConn._proto._onClose(null);
+        }
     }
 
     /**
@@ -284,7 +310,7 @@ export default class XmppConnection extends Listenable {
      * @returns {void}
      */
     disconnect(...args) {
-        clearTimeout(this._resumeTimeout);
+        this._resumeTask.cancel();
         clearTimeout(this._wsKeepAlive);
         this._clearDeferredIQs();
         this._stropheConn.disconnect(...args);
@@ -434,7 +460,8 @@ export default class XmppConnection extends Listenable {
                 this.sendIQ(
                     iq,
                     result => resolve(result),
-                    error => reject(error));
+                    error => reject(error),
+                    timeout);
             } else {
                 const deferred = {
                     iq,
@@ -453,6 +480,18 @@ export default class XmppConnection extends Listenable {
                 this._deferredIQs.push(deferred);
             }
         });
+    }
+
+    /**
+     * Called by the ping plugin when ping fails too many times.
+     *
+     * @returns {void}
+     */
+    _onPingErrorThresholdExceeded() {
+        if (this.isUsingWebSocket) {
+            logger.warn('Ping error threshold exceeded - killing the WebSocket');
+            this.closeWebsocket();
+        }
     }
 
     /**
@@ -524,32 +563,7 @@ export default class XmppConnection extends Listenable {
         const resumeToken = streamManagement && streamManagement.getResumeToken();
 
         if (resumeToken) {
-            clearTimeout(this._resumeTimeout);
-
-            // FIXME detect internet offline
-            // The retry delay will be:
-            //   1st retry: 1.5s - 3s
-            //   2nd retry: 3s - 9s
-            //   3rd retry: 3s - 27s
-            this._resumeRetryN = Math.min(3, this._resumeRetryN + 1);
-            const retryTimeout = getJitterDelay(this._resumeRetryN, 1500, 3);
-
-            logger.info(`Will try to resume the XMPP connection in ${retryTimeout}ms`);
-
-            this._resumeTimeout = setTimeout(() => {
-                logger.info('Trying to resume the XMPP connection');
-
-                const url = new URL(this._stropheConn.service);
-                let { search } = url;
-
-                search += search.indexOf('?') === -1 ? `?previd=${resumeToken}` : `&previd=${resumeToken}`;
-
-                url.search = search;
-
-                this._stropheConn.service = url.toString();
-
-                streamManagement.resume();
-            }, retryTimeout);
+            this._resumeTask.schedule();
 
             return true;
         }
